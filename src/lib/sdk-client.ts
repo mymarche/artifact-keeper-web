@@ -6,8 +6,6 @@
  * - Automatic 401 token refresh with mutex to prevent race conditions
  * - Dynamic baseUrl for remote instance proxy
  * - 403 SETUP_REQUIRED redirect to login
- * - Post-freeze cookie debounce: delays requests after Chrome unfreezes a tab
- *   to allow the cookie store to rehydrate before sending fetch() calls.
  *
  * Import this module (side-effect) before using any SDK functions:
  *   import '@/lib/sdk-client';
@@ -43,33 +41,6 @@ function isRemoteInstance(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Post-freeze cookie debounce
-// ---------------------------------------------------------------------------
-// Chrome freezes background tabs after ~5 min. On unfreeze, the cookie store
-// may not be rehydrated yet, so the first fetch() can go out without cookies.
-// We detect long hidden periods and delay the next request to give the browser
-// time to restore its cookie store.
-
-const COOKIE_REHYDRATE_MS = 500;
-const FREEZE_THRESHOLD_MS = 5 * 60 * 1000;
-
-let lastHiddenAt = 0;
-let cookieReady: Promise<void> = Promise.resolve();
-
-if (typeof window !== 'undefined') {
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-      lastHiddenAt = Date.now();
-    } else if (document.visibilityState === 'visible' && lastHiddenAt > 0) {
-      const idleDuration = Date.now() - lastHiddenAt;
-      if (idleDuration > FREEZE_THRESHOLD_MS) {
-        cookieReady = new Promise((resolve) => setTimeout(resolve, COOKIE_REHYDRATE_MS));
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Configure the global SDK client
 // ---------------------------------------------------------------------------
 
@@ -79,14 +50,10 @@ client.setConfig({
 });
 
 // ---------------------------------------------------------------------------
-// Request interceptor: cookie debounce + dynamic baseUrl for remote instances
+// Request interceptor: dynamic baseUrl for remote instances
 // ---------------------------------------------------------------------------
 
-client.interceptors.request.use(async (request) => {
-  if (typeof window !== 'undefined') {
-    await cookieReady;
-  }
-
+client.interceptors.request.use((request) => {
   if (typeof window === 'undefined') return request;
   if (!isRemoteInstance()) return request;
 
