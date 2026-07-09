@@ -6,6 +6,8 @@
  * - Automatic 401 token refresh with mutex to prevent race conditions
  * - Dynamic baseUrl for remote instance proxy
  * - 403 SETUP_REQUIRED redirect to login
+ * - Post-freeze cookie debounce: delays requests after Chrome unfreezes a tab
+ *   to allow the cookie store to rehydrate before sending fetch() calls.
  *
  * Import this module (side-effect) before using any SDK functions:
  *   import '@/lib/sdk-client';
@@ -41,6 +43,91 @@ function isRemoteInstance(): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Post-freeze cookie debounce
+// -----------------------------------------------------
+// Chrome freezes background tabs after ~5 min. On unfreeze, the cookie store
+// may not be rehydrated yet, so the first fetch() can go out without cookies,
+// triggering a native Basic Auth dialog (WWW-Authenticate: Basic).
+// We detect long hidden periods and delay all requests to give Chrome time to
+// rehydrate its cookie store before any fetch is dispatched.
+
+const COOKIE_REHYDRATE_MS = 1000;
+const FREEZE_THRESHOLD_MS = 5 * 60 * 1000;
+
+let lastHiddenAt = 0;
+let cookieReady: Promise<void> = Promise.resolve();
+
+if (typeof window !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      lastHiddenAt = Date.now();
+    } else if (document.visibilityState === 'visible' && lastHiddenAt > 0) {
+      const idleDuration = Date.now() - lastHiddenAt;
+      if (idleDuration > FREEZE_THRESHOLD_MS) {
+        cookieReady = new Promise((resolve) => setTimeout(resolve, COOKIE_REHYDRATE_MS));
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Global fetch wrapper
+// ---------------------------------------------------------------------------
+// TanStack Query and Next.js RSC use raw fetch(), which bypasses the SDK
+// interceptor. Wrap global fetch so ALL requests wait for the cookie store.
+
+let wrappedFetch: typeof fetch | undefined;
+
+if (typeof window !== 'undefined') {
+  const originalFetch = window.fetch.bind(window);
+  wrappedFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    await cookieReady;
+    const headers = new Headers(init?.headers);
+    if (!headers.has('Authorization')) {
+      headers.set('Authorization', 'Basic ');
+    }
+    const opts: RequestInit = {
+      credentials: 'include' as RequestCredentials,
+      ...init,
+      headers,
+    };
+    return originalFetch(input, opts);
+  };
+  window.fetch = wrappedFetch;
+}
+
+// ---------------------------------------------------------------------------
+// Configure the global SDK client
+// ---------------------------------------------------------------------------
+
+client.setConfig({
+  baseUrl: getActiveInstanceBaseUrl(),
+  credentials: 'include',
+  ...(wrappedFetch ? { fetch: wrappedFetch } : {}),
+});
+
+// ---------------------------------------------------------------------------
+// Request interceptor: dynamic baseUrl for remote instances
+// ---------------------------------------------------------------------------
+
+client.interceptors.request.use((request) => {
+  if (typeof window === 'undefined') return request;
+  if (!isRemoteInstance()) return request;
+
+  const base = getActiveInstanceBaseUrl();
+  if (!base) return request;
+
+  // For remote instances, prepend the proxy path prefix to the existing URL.
+  // Only modify the pathname; never rewrite protocol or host to prevent
+  // open redirect attacks via localStorage instance poisoning.
+  const url = new URL(request.url);
+  const target = new URL(base, window.location.origin);
+  url.pathname = target.pathname + url.pathname;
+
+  return new Request(url.toString(), request);
+});
+
+// ---------------------------------------------------------------------------
 // Configure the global SDK client
 // ---------------------------------------------------------------------------
 
@@ -50,10 +137,14 @@ client.setConfig({
 });
 
 // ---------------------------------------------------------------------------
-// Request interceptor: dynamic baseUrl for remote instances
+// Request interceptor: cookie debounce + dynamic baseUrl for remote instances
 // ---------------------------------------------------------------------------
 
-client.interceptors.request.use((request) => {
+client.interceptors.request.use(async (request) => {
+  if (typeof window !== 'undefined') {
+    await cookieReady;
+  }
+
   if (typeof window === 'undefined') return request;
   if (!isRemoteInstance()) return request;
 
